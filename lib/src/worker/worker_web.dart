@@ -3,9 +3,7 @@ import 'package:worker_manager/src/scheduling/task.dart';
 import 'package:worker_manager/src/worker/worker.dart';
 
 class WorkerImpl implements Worker {
-  final void Function() onReviseAfterTimeout;
-
-  WorkerImpl(this.onReviseAfterTimeout);
+  WorkerImpl();
 
   @override
   var initialized = false;
@@ -37,10 +35,8 @@ class WorkerImpl implements Worker {
   }
 
   @override
-  Future<void> restart() async {
-    kill();
-    await initialize();
-    onReviseAfterTimeout();
+  void cancelGentle() {
+    _cleanUp();
   }
 
   @override
@@ -53,4 +49,7 @@ class WorkerImpl implements Worker {
     onMessage = null;
     taskId = null;
   }
+
+  @override
+  bool get initializing => false;
 }

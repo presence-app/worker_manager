@@ -2,48 +2,50 @@ import 'dart:async';
 import 'dart:isolate';
 import 'package:worker_manager/src/cancelable/cancelable.dart';
 import 'package:worker_manager/src/scheduling/task.dart';
+import 'package:worker_manager/src/worker/cancel_request.dart';
 import 'package:worker_manager/src/worker/result.dart';
 import 'package:worker_manager/src/worker/worker.dart';
 
 class WorkerImpl implements Worker {
-  final void Function() onReviseAfterTimeout;
-
-  WorkerImpl(this.onReviseAfterTimeout);
+  WorkerImpl();
 
   late Isolate _isolate;
   late RawReceivePort _receivePort;
   late SendPort _sendPort;
-  Completer? _result;
+  Completer<void>? _sendPortReceived;
 
-  late Completer<void> _sendPortReceived;
+  Completer? _result;
+  void Function(Object value)? onMessage;
 
   @override
-  var initialized = false;
+  bool get initialized => _sendPortReceived?.isCompleted ?? false;
 
   @override
   String? taskId;
 
-  void Function(Object value)? onMessage;
+  @override
+  bool get initializing {
+    final sendPortReceived = _sendPortReceived;
+    if (sendPortReceived != null) {
+      return !sendPortReceived.isCompleted;
+    }
+    return false;
+  }
 
   @override
   Future<void> initialize() async {
     _sendPortReceived = Completer<void>();
     _receivePort = RawReceivePort();
     _receivePort.handler = (Object result) {
-      final resultChecked = result;
-      if (resultChecked is SendPort) {
-        _sendPort = result as SendPort;
-        _sendPortReceived.complete();
-      } else if (resultChecked is ResultSuccess) {
-        _result!.complete((result as ResultSuccess).value);
-        _result = null;
-      } else if (resultChecked is ResultError) {
-        final error = (result as ResultError).error;
+      if (result is SendPort) {
+        _sendPort = result;
+        _sendPortReceived!.complete();
+      } else if (result is ResultSuccess) {
+        _result!.complete(result.value);
+        _cleanUp();
+      } else if (result is ResultError) {
         _result!.completeError(result.error, result.stackTrace);
-        _result = null;
-        if (error is TimeoutException) {
-          restart();
-        }
+        _cleanUp();
       } else {
         onMessage?.call(result);
       }
@@ -54,38 +56,30 @@ class WorkerImpl implements Worker {
       errorsAreFatal: false,
       paused: false,
     );
-    initialized = true;
+    await _sendPortReceived!.future;
   }
 
   @override
   Future<R> work<R>(Task<R> task) async {
     taskId = task.id;
     _result = Completer();
-    _isolate.resume(_isolate.pauseCapability!);
-    await _sendPortReceived.future;
     _sendPort.send(task.execution);
-    if (task is TaskWithPort) {
-      onMessage = (task as TaskWithPort).onMessage;
+    if (task is WithPort) {
+      onMessage = (task as WithPort).onMessage;
     }
-    final resultValue = await (_result!.future as Future<R>).whenComplete(() {
-      _cleanUp();
-      _isolate.pause(_isolate.pauseCapability!);
-    });
+    final resultValue = await (_result!.future as Future<R>);
     return resultValue;
   }
 
   @override
-  Future<void> restart() async {
-    kill();
-    await initialize();
-    onReviseAfterTimeout();
+  void cancelGentle() {
+    _sendPort.send(CancelRequest());
   }
 
   @override
   void kill() {
     _cleanUp();
-    _result?.completeError(CanceledError());
-    initialized = false;
+    _sendPortReceived = null;
     _receivePort.close();
     _isolate.kill(priority: Isolate.immediate);
   }
@@ -93,16 +87,32 @@ class WorkerImpl implements Worker {
   void _cleanUp() {
     onMessage = null;
     taskId = null;
+    _result = null;
   }
 
   static void _anotherIsolate(SendPort sendPort) {
     final receivePort = RawReceivePort();
     sendPort.send(receivePort.sendPort);
+    var canceled = false;
     receivePort.handler = (message) async {
       try {
-        final result =
-            message is Execute ? await message() : await message(sendPort);
-        sendPort.send(ResultSuccess(result));
+        late final dynamic result;
+        canceled = false;
+        if (message is Execute) {
+          result = await message();
+        } else if (message is ExecuteWithPort) {
+          result = await message(sendPort);
+        } else if (message is ExecuteGentle) {
+          result = await message(() => canceled);
+        } else if (message is ExecuteGentleWithPort) {
+          result = await message(sendPort, () => canceled);
+        } else if (message is CancelRequest) {
+          canceled = true;
+          throw CanceledError();
+        }
+        if(!canceled){
+          sendPort.send(ResultSuccess(result));
+        } 
       } catch (error, stackTrace) {
         sendPort.send(ResultError(error, stackTrace));
       }

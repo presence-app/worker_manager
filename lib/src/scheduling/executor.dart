@@ -1,37 +1,41 @@
-part of worker_manager;
+part of '../../worker_manager.dart';
 
 final workerManager = _Executor();
+
+// [-2^54; 2^53] is compatible with dart2js, see core.int doc
+const _minId = -9007199254740992;
+const _maxId = 9007199254740992;
 
 class _Executor extends Mixinable<_Executor> with _ExecutorLogger {
   final _queue = PriorityQueue<Task>();
   final _pool = <Worker>[];
-  final _pausedTaskBuffer = <int, Task>{};
+  var _nextTaskId = _minId;
+  var _dynamicSpawning = false;
+  var _isolatesCount = numberOfProcessors;
 
   @override
-  late String _currentTaskId;
-
-  @override
-  Future<void> init({int? isolatesCount}) async {
-    if (_pool.isNotEmpty) throw Exception("worker_manager already warmed up");
-    _createWorkers(isolatesCount ?? numberOfProcessors);
-    await _initializeWorkers();
-    super.init(isolatesCount: isolatesCount);
-    _schedule();
-  }
-
-  void _createWorkers(int count) {
-    for (var i = 0; i < count; i++) {
-      _pool.add(Worker(_schedule));
+  Future<void> init({int? isolatesCount, bool? dynamicSpawning}) async {
+    if (_pool.isNotEmpty) {
+      print(
+        "worker_manager already warmed up, init is ignored. Dispose before init",
+      );
+      return;
     }
-  }
-
-  Future<void> _initializeWorkers() async {
-    await Future.wait(_pool.map((e) => e.initialize()));
+    if (isolatesCount != null) {
+      if (isolatesCount < 0) {
+        throw Exception("isolatesCount must be greater than 0");
+      }
+      if (isolatesCount < numberOfProcessors) {
+        _isolatesCount = isolatesCount;
+      }
+    }
+    _dynamicSpawning = dynamicSpawning ?? false;
+    await _ensureWorkersInitialized();
+    super.init();
   }
 
   @override
   Future<void> dispose() async {
-    _pausedTaskBuffer.clear();
     _queue.clear();
     for (final worker in _pool) {
       worker.kill();
@@ -40,93 +44,196 @@ class _Executor extends Mixinable<_Executor> with _ExecutorLogger {
     super.dispose();
   }
 
-  Cancelable<R> executeWithPort<R, T>(
-      ExecuteWithPort<R> execution, {
-        WorkPriority priority = WorkPriority.immediately,
-        required void Function(T value) onMessage,
-      }) {
-    _ensureWorkersInitialized();
-    _currentTaskId = Uuid().v4();
-    final task = _createTaskWithPort<R, T>(execution, priority, (message){
-      onMessage(message as T);
-    });
-    _queue.add(task);
-    _schedule();
-    return _createCancelable(task);
-  }
-
-  @override
   Cancelable<R> execute<R>(
-      Execute<R> execution, {
-        WorkPriority priority = WorkPriority.immediately,
-      }) {
-    _ensureWorkersInitialized();
-    _currentTaskId = Uuid().v4();
-    final task = _createTaskRegular<R>(execution, priority);
-    _queue.add(task);
-    _schedule();
-    super.execute(execution);
-    return _createCancelable(task);
+    Execute<R> execution, {
+    WorkPriority priority = WorkPriority.immediately,
+  }) {
+    return _createCancelable<R>(
+      execution: execution,
+      priority: priority,
+    );
   }
 
-  void _ensureWorkersInitialized() {
-    if (_pool.isEmpty) {
-      init();
+  Cancelable<R> executeNow<R>(ExecuteGentle<R> execution) {
+    final task = TaskGentle<R>(
+      id: "",
+      workPriority: WorkPriority.immediately,
+      execution: execution,
+      completer: Completer<R>(),
+    );
+
+    Future<void> run() async {
+      try{
+        final result = await execution(() => task.canceled);
+        task.complete(result, null, null);
+      }catch (error, st){
+        task.complete(null, error, st);
+      }
+    }
+    run();
+    return Cancelable(
+        completer: task.completer,
+        onCancel: () => _cancel(task),
+      );
+  }
+
+  Cancelable<R> executeWithPort<R, T>(
+    ExecuteWithPort<R> execution, {
+    WorkPriority priority = WorkPriority.immediately,
+    required void Function(T value) onMessage,
+  }) {
+    return _createCancelable<R>(
+      execution: execution,
+      priority: priority,
+      onMessage: (message) => onMessage(message as T),
+    );
+  }
+
+  Cancelable<R> executeGentle<R>(
+    ExecuteGentle<R> execution, {
+    WorkPriority priority = WorkPriority.immediately,
+  }) {
+    return _createCancelable<R>(
+      execution: execution,
+      priority: priority,
+    );
+  }
+
+  Cancelable<R> executeGentleWithPort<R, T>(
+    ExecuteGentleWithPort<R> execution, {
+    WorkPriority priority = WorkPriority.immediately,
+    required void Function(T value) onMessage,
+  }) {
+    return _createCancelable<R>(
+      execution: execution,
+      priority: priority,
+      onMessage: (message) => onMessage(message as T),
+    );
+  }
+
+  void _createWorkers() {
+    for (var i = 0; i < _isolatesCount; i++) {
+      _pool.add(Worker());
     }
   }
 
-  TaskWithPort<R> _createTaskWithPort<R, T>(ExecuteWithPort<R> execution, WorkPriority priority, void Function(Object value) onMessage) {
-    final completer = Completer<R>();
-    return TaskWithPort(
-      id: _currentTaskId,
-      workPriority: priority,
-      execution: execution,
-      completer: completer,
-      onMessage: onMessage,
-    );
+  Future<void> _initializeWorkers() async {
+    await Future.wait(_pool.map((e) => e.initialize()));
   }
 
-  TaskRegular<R> _createTaskRegular<R>(Execute<R> execution, WorkPriority priority) {
+  Cancelable<R> _createCancelable<R>({
+    required Function execution,
+    WorkPriority priority = WorkPriority.immediately,
+    void Function(Object value)? onMessage,
+  }) {
+    if (_nextTaskId + 1 == _maxId) {
+      _nextTaskId = _minId;
+    }
+    final id = _nextTaskId.toString();
+    _nextTaskId++;
+    late final Task<R> task;
     final completer = Completer<R>();
-    return TaskRegular(
-      id: _currentTaskId,
-      workPriority: priority,
-      execution: execution,
-      completer: completer,
-    );
-  }
-
-  Cancelable<R> _createCancelable<R>(Task<R> task) {
+    if (execution is Execute<R>) {
+      task = TaskRegular<R>(
+        id: id,
+        workPriority: priority,
+        execution: execution,
+        completer: completer,
+      );
+    } else if (execution is ExecuteWithPort<R>) {
+      task = TaskWithPort<R>(
+        id: id,
+        workPriority: priority,
+        execution: execution,
+        completer: completer,
+        onMessage: onMessage!,
+      );
+    } else if (execution is ExecuteGentle<R>) {
+      task = TaskGentle<R>(
+        id: id,
+        workPriority: priority,
+        execution: execution,
+        completer: completer,
+      );
+    } else if (execution is ExecuteGentleWithPort<R>) {
+      task = TaskGentleWithPort<R>(
+        id: id,
+        workPriority: priority,
+        execution: execution,
+        completer: completer,
+        onMessage: onMessage!,
+      );
+    }
+    _queue.add(task);
+    _schedule();
+    logTaskAdded(task.id);
     return Cancelable(
       completer: task.completer,
       onCancel: () => _cancel(task),
     );
   }
 
+  Future<void> _ensureWorkersInitialized() async {
+    if (_pool.isEmpty) {
+      _createWorkers();
+      if (!_dynamicSpawning) {
+        await _initializeWorkers();
+        final poolSize = _pool.length;
+        final queueSize = _queue.length;
+        for (int i = 0; i <= min(poolSize, queueSize); i++) {
+          _schedule();
+        }
+      }
+    }
+    if (_pool.every((worker) => worker.taskId != null)) {
+      return;
+    }
+    if (_dynamicSpawning) {
+      final freeWorker = _pool.firstWhereOrNull(
+        (worker) =>
+            worker.taskId == null &&
+            !worker.initialized &&
+            !worker.initializing,
+      );
+      await freeWorker?.initialize();
+      _schedule();
+    }
+  }
+
   void _schedule() {
     final availableWorker = _pool.firstWhereOrNull(
-          (iw) => iw.taskId == null && iw.initialized,
+      (worker) => worker.taskId == null && worker.initialized,
     );
-    if (_pool.isEmpty || _queue.isEmpty || availableWorker == null) return;
-
+    if (availableWorker == null) {
+      _ensureWorkersInitialized();
+      return;
+    }
+    if (_queue.isEmpty) return;
     final task = _queue.removeFirst();
-    final completer = task.completer;
+
     availableWorker.work(task).then((value) {
-      completer.complete(value);
+      //could be completed already by cancel and it is normal.
+      //Assuming that worker finished with error and cleaned gracefully
+      task.complete(value, null, null);
     }, onError: (error, st) {
-      completer.completeError(error, st);
+      task.complete(null, error, st);
     }).whenComplete(() {
+      if (_dynamicSpawning && _queue.isEmpty) availableWorker.kill();
       _schedule();
     });
   }
 
   @override
   void _cancel(Task task) {
-    if (_queue.remove(task)) {
-      task.completer.completeError(CanceledError());
-      return;
+    task.cancel();
+    _queue.remove(task);
+    final targetWorker = _pool.firstWhereOrNull((worker) => worker.taskId == task.id);
+    if (task is Gentle) {
+      targetWorker?.cancelGentle();
+    } else {
+      targetWorker?.kill();
+      if (!_dynamicSpawning) targetWorker?.initialize();
     }
-    _pool.firstWhereOrNull((worker) => worker.taskId == task.id)?.restart();
     super._cancel(task);
   }
 }

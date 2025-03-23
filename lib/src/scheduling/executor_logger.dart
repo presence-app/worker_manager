@@ -1,4 +1,4 @@
-part of worker_manager;
+part of '../../worker_manager.dart';
 
 class Mixinable<T> {
   late final itSelf = this as T;
@@ -7,30 +7,25 @@ class Mixinable<T> {
 mixin _ExecutorLogger on Mixinable<_Executor> {
   var log = false;
 
-  static const String _debugPrefix = 'WorkerManager:';
-
-  String get _currentTaskId;
-
   @mustCallSuper
-  void init({int? isolatesCount}) {
+  void init() {
     logMessage(
-      "$_debugPrefix ${isolatesCount ?? numberOfProcessors} workers have been spawned and initialized",
+      "${itSelf._isolatesCount} workers have been spawned and initialized",
     );
   }
 
-  @mustCallSuper
-  void execute<R>(FutureOr<R> Function() execution) {
-    logMessage("$_debugPrefix added task with number $_currentTaskId");
+  void logTaskAdded<R>(String uid) {
+    logMessage("added task with number $uid");
   }
 
   @mustCallSuper
   void dispose() {
-    logMessage("$_debugPrefix worker_manager have been disposed");
+    logMessage("worker_manager have been disposed");
   }
 
   @mustCallSuper
   void _cancel(Task task) {
-    logMessage("$_debugPrefix Task ${task.id} have been canceled");
+    logMessage("Task ${task.id} have been canceled");
   }
 
   void logMessage(String message) {
