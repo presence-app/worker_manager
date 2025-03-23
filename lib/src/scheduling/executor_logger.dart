@@ -6,26 +6,27 @@ class Mixinable<T> {
 
 mixin _ExecutorLogger on Mixinable<_Executor> {
   var log = false;
+  static const String _debugPrefix = 'WorkerManager:';
 
   @mustCallSuper
   void init() {
     logMessage(
-      "${itSelf._isolatesCount} workers have been spawned and initialized",
+      "$_debugPrefix ${itSelf._isolatesCount} workers have been spawned and initialized",
     );
   }
 
   void logTaskAdded<R>(String uid) {
-    logMessage("added task with number $uid");
+    logMessage("$_debugPrefix added task with number $uid");
   }
 
   @mustCallSuper
   void dispose() {
-    logMessage("worker_manager have been disposed");
+    logMessage("$_debugPrefix worker_manager have been disposed");
   }
 
   @mustCallSuper
   void _cancel(Task task) {
-    logMessage("Task ${task.id} have been canceled");
+    logMessage("$_debugPrefix Task ${task.id} have been canceled");
   }
 
   void logMessage(String message) {
